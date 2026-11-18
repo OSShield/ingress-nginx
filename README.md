@@ -7,6 +7,10 @@
 >
 > Interested in a CVE-free container image of this project? [Contact Chainguard](https://www.chainguard.dev/contact).
 
+## Migrate from ingress-nginx
+
+Switch an existing Helm release to the OSShield chart in place. The [migration guide](docs/migrate-from-ingress-nginx.md) covers preserving your configuration, previewing the upgrade, checking live traffic, and rolling back.
+
 ## NGINX source patches and ABI
 
 This fork compiles NGINX from source with a series of patches applied from
