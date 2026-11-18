@@ -1,0 +1,198 @@
+name: Build and publish images and chart
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: cr.osshield.eu
+  CONTROLLER_IMAGE: cr.osshield.eu/nginx/controller
+  PROXY_IMAGE: cr.osshield.eu/nginx/proxy
+  IMAGE_TAG: latest
+  IMAGE_VERSION_TAG: v1.15.15
+
+# Configure REGISTRY_USERNAME and REGISTRY_PASSWORD as repository secrets.
+jobs:
+  proxy:
+    name: Build and push NGINX proxy
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # v4.0.0
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      # Build separately so registry credentials do not expire during compilation.
+      - name: Build proxy for amd64 and arm64
+        run: |
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --tag "${PROXY_IMAGE}:${IMAGE_TAG}" \
+            --tag "${PROXY_IMAGE}:${IMAGE_VERSION_TAG}" \
+            images/nginx/rootfs
+
+      - uses: scheiblingco/redskap-actions/docker-login@v1
+        with:
+          instance: https://pkg.osshield.eu
+          vhost: cr.osshield.eu
+
+      - name: Push proxy images and multi-platform manifest
+        id: build
+        run: |
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --tag "${PROXY_IMAGE}:${IMAGE_TAG}" \
+            --tag "${PROXY_IMAGE}:${IMAGE_VERSION_TAG}" \
+            --metadata-file proxy-metadata.json \
+            --push \
+            images/nginx/rootfs
+          python3 - <<'PY'
+          import json
+          import os
+          with open('proxy-metadata.json') as metadata:
+              digest = json.load(metadata)['containerimage.digest']
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'digest={digest}\n')
+          PY
+
+  controller:
+    name: Build and push controller
+    runs-on: ubuntu-latest
+    needs: proxy
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: GOLANG_VERSION
+
+      - name: Build controller, debug tool and shutdown hook for both architectures
+        env:
+          GOOS: linux
+          PKG: k8s.io/ingress-nginx
+          TAG: ${{ env.IMAGE_TAG }}
+          COMMIT_SHA: ${{ github.sha }}
+          REPO_INFO: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          for arch in amd64 arm64; do
+            ARCH="$arch" bash build/build.sh
+          done
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # v4.0.0
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - uses: scheiblingco/redskap-actions/docker-login@v1
+        with:
+          instance: https://pkg.osshield.eu
+          vhost: cr.osshield.eu
+
+      - name: Build and push controller images and multi-platform manifest
+        id: build
+        env:
+          PROXY_DIGEST: ${{ needs.proxy.outputs.digest }}
+        run: |
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --build-arg "BASE_IMAGE=${PROXY_IMAGE}@${PROXY_DIGEST}" \
+            --build-arg "VERSION=${IMAGE_VERSION_TAG}" \
+            --build-arg "COMMIT_SHA=${GITHUB_SHA}" \
+            --build-arg "BUILD_ID=${GITHUB_RUN_ID}" \
+            --tag "${CONTROLLER_IMAGE}:${IMAGE_TAG}" \
+            --tag "${CONTROLLER_IMAGE}:${IMAGE_VERSION_TAG}" \
+            --metadata-file controller-metadata.json \
+            --push \
+            rootfs
+          python3 - <<'PY'
+          import json
+          import os
+          with open('controller-metadata.json') as metadata:
+              digest = json.load(metadata)['containerimage.digest']
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'digest={digest}\n')
+          PY
+
+  chart:
+    name: Package and upload Helm chart
+    needs: controller
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Helm
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
+        with:
+          version: v4.1.3
+
+      - name: Point packaged chart at the published controller
+        env:
+          CONTROLLER_DIGEST: ${{ needs.controller.outputs.digest }}
+          IMAGE_VERSION_TAG: ${{ env.IMAGE_VERSION_TAG }}
+        run: |
+          # Modify only the runner's checkout; other chart images keep their defaults.
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          values = Path('charts/ingress-nginx/values.yaml')
+          registry, image = os.environ['CONTROLLER_IMAGE'].split('/', 1)
+          print("Registry:", registry)
+          print("Image:", image)
+          print("Image Version Tag:", os.environ['IMAGE_VERSION_TAG'])
+          overrides = {
+              'registry': registry,
+              'image': image,
+              'tag': os.environ['IMAGE_VERSION_TAG'],
+              'digest': os.environ['CONTROLLER_DIGEST'],
+          }
+          lines = values.read_text().splitlines(keepends=True)
+          start = lines.index('  image:\n', lines.index('controller:\n'))
+          for index in range(start + 1, len(lines)):
+              line = lines[index]
+              if line.strip() and not line.startswith(('    ', '#')):
+                  break
+              for key, value in overrides.items():
+                  if line.startswith(f'    {key}:') or line.startswith(f'    # {key}:'):
+                      lines[index] = f'    {key}: {json.dumps(value)}\n'
+          values.write_text(''.join(lines))
+          PY
+
+      - name: Package Helm chart
+        run: helm package charts/ingress-nginx --app-version "$IMAGE_VERSION_TAG" --destination dist
+
+      - uses: scheiblingco/redskap-actions/upload@v1
+        with:
+          instance: https://pkg.osshield.eu
+          vhost: helm.osshield.eu
+          type: helm
+          files: dist/*.tgz
+
+
+      # Sample upload: replace with your chart registry or repository upload.
+      - name: Upload Helm chart as a workflow artifact
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: ingress-nginx-chart
+          path: dist/*.tgz
+          if-no-files-found: error
