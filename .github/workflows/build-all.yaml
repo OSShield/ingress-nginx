@@ -8,133 +8,65 @@ permissions:
   id-token: write
 
 env:
-  REGISTRY: cr.osshield.eu
-  CONTROLLER_IMAGE: cr.osshield.eu/nginx/controller
-  PROXY_IMAGE: cr.osshield.eu/nginx/proxy
+  CONTROLLER_IMAGE: &controller_image cr.osshield.eu/nginx/controller
+  PROXY_IMAGE: &proxy_image cr.osshield.eu/nginx/proxy
   IMAGE_TAG: latest
-  IMAGE_VERSION_TAG: v1.15.15
+  IMAGE_VERSION_TAG: &version v1.15.15
 
-# Configure REGISTRY_USERNAME and REGISTRY_PASSWORD as repository secrets.
 jobs:
-  proxy:
-    name: Build and push NGINX proxy
+  amd64:
+    uses: ./.github/workflows/build-amd64.yaml
+    with: &build_inputs
+      controller_image: *controller_image
+      proxy_image: *proxy_image
+      version: *version
+
+  arm64:
+    uses: ./.github/workflows/build-arm64.yaml
+    with: *build_inputs
+
+  publish:
+    name: Publish multi-platform image tags
+    needs: [amd64, arm64]
     runs-on: ubuntu-latest
-    timeout-minutes: 180
     outputs:
-      digest: ${{ steps.build.outputs.digest }}
+      controller_digest: ${{ steps.manifests.outputs.controller_digest }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # v4.0.0
-        with:
-          platforms: arm64
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
-
-      # Build separately so registry credentials do not expire during compilation.
-      - name: Build proxy for amd64 and arm64
-        run: |
-          docker buildx build \
-            --platform linux/amd64,linux/arm64 \
-            --tag "${PROXY_IMAGE}:${IMAGE_TAG}" \
-            --tag "${PROXY_IMAGE}:${IMAGE_VERSION_TAG}" \
-            images/nginx/rootfs
+        with:
+          version: v0.34.0
 
       - uses: scheiblingco/redskap-actions/docker-login@v2
         with:
           instance: https://pkg.osshield.eu
           vhost: cr.osshield.eu
 
-      - name: Push proxy images and multi-platform manifest
-        id: build
+      - name: Combine amd64 and arm64 manifests
+        id: manifests
+        env:
+          AMD64_PROXY: ${{ needs.amd64.outputs.proxy_digest }}
+          ARM64_PROXY: ${{ needs.arm64.outputs.proxy_digest }}
+          AMD64_CONTROLLER: ${{ needs.amd64.outputs.controller_digest }}
+          ARM64_CONTROLLER: ${{ needs.arm64.outputs.controller_digest }}
         run: |
-          docker buildx build \
-            --platform linux/amd64,linux/arm64 \
+          docker buildx imagetools create \
             --tag "${PROXY_IMAGE}:${IMAGE_TAG}" \
             --tag "${PROXY_IMAGE}:${IMAGE_VERSION_TAG}" \
-            --metadata-file proxy-metadata.json \
-            --push \
-            images/nginx/rootfs
-          python3 - <<'PY'
-          import json
-          import os
-          with open('proxy-metadata.json') as metadata:
-              digest = json.load(metadata)['containerimage.digest']
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
-              output.write(f'digest={digest}\n')
-          PY
+            "${PROXY_IMAGE}@${AMD64_PROXY}" "${PROXY_IMAGE}@${ARM64_PROXY}"
 
-  controller:
-    name: Build and push controller
-    runs-on: ubuntu-latest
-    needs: proxy
-    outputs:
-      digest: ${{ steps.build.outputs.digest }}
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Set up Go
-        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
-        with:
-          go-version-file: GOLANG_VERSION
-
-      - name: Build controller, debug tool and shutdown hook for both architectures
-        env:
-          GOOS: linux
-          PKG: k8s.io/ingress-nginx
-          TAG: ${{ env.IMAGE_TAG }}
-          COMMIT_SHA: ${{ github.sha }}
-          REPO_INFO: ${{ github.server_url }}/${{ github.repository }}
-        run: |
-          for arch in amd64 arm64; do
-            ARCH="$arch" bash build/build.sh
-          done
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # v4.0.0
-        with:
-          platforms: arm64
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
-
-      - uses: scheiblingco/redskap-actions/docker-login@v2
-        with:
-          instance: https://pkg.osshield.eu
-          vhost: cr.osshield.eu
-
-      - name: Build and push controller images and multi-platform manifest
-        id: build
-        env:
-          PROXY_DIGEST: ${{ needs.proxy.outputs.digest }}
-        run: |
-          docker buildx build \
-            --platform linux/amd64,linux/arm64 \
-            --build-arg "BASE_IMAGE=${PROXY_IMAGE}@${PROXY_DIGEST}" \
-            --build-arg "VERSION=${IMAGE_VERSION_TAG}" \
-            --build-arg "COMMIT_SHA=${GITHUB_SHA}" \
-            --build-arg "BUILD_ID=${GITHUB_RUN_ID}" \
+          docker buildx imagetools create \
             --tag "${CONTROLLER_IMAGE}:${IMAGE_TAG}" \
             --tag "${CONTROLLER_IMAGE}:${IMAGE_VERSION_TAG}" \
-            --metadata-file controller-metadata.json \
-            --push \
-            rootfs
-          python3 - <<'PY'
-          import json
-          import os
-          with open('controller-metadata.json') as metadata:
-              digest = json.load(metadata)['containerimage.digest']
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
-              output.write(f'digest={digest}\n')
-          PY
+            --metadata-file controller-index.json \
+            "${CONTROLLER_IMAGE}@${AMD64_CONTROLLER}" "${CONTROLLER_IMAGE}@${ARM64_CONTROLLER}"
+
+          digest=$(jq -er '."containerimage.descriptor".digest' controller-index.json)
+          printf 'controller_digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
 
   chart:
     name: Package and upload Helm chart
-    needs: controller
+    needs: publish
     runs-on: ubuntu-latest
 
     steps:
@@ -148,7 +80,7 @@ jobs:
 
       - name: Point packaged chart at the published controller
         env:
-          CONTROLLER_DIGEST: ${{ needs.controller.outputs.digest }}
+          CONTROLLER_DIGEST: ${{ needs.publish.outputs.controller_digest }}
           IMAGE_VERSION_TAG: ${{ env.IMAGE_VERSION_TAG }}
         run: |
           # Modify only the runner's checkout; other chart images keep their defaults.

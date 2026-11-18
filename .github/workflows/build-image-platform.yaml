@@ -1,0 +1,101 @@
+name: Build images for one platform
+
+on:
+  workflow_call:
+    inputs:
+      arch:
+        type: string
+        required: true
+      runner:
+        type: string
+        required: true
+      controller_image:
+        type: string
+        required: true
+      proxy_image:
+        type: string
+        required: true
+      version:
+        type: string
+        required: true
+    outputs:
+      proxy_digest:
+        value: ${{ jobs.build.outputs.proxy_digest }}
+      controller_digest:
+        value: ${{ jobs.build.outputs.controller_digest }}
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 180
+    env:
+      ARCH: ${{ inputs.arch }}
+      PROXY_IMAGE: ${{ inputs.proxy_image }}
+      CONTROLLER_IMAGE: ${{ inputs.controller_image }}
+      IMAGE_VERSION_TAG: ${{ inputs.version }}
+      # Keep intermediate tags unique across architectures, runs, and retries.
+      BUILD_TAG: build-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.arch }}
+    outputs:
+      proxy_digest: ${{ steps.proxy.outputs.digest }}
+      controller_digest: ${{ steps.controller.outputs.digest }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: GOLANG_VERSION
+
+      - name: Build controller binaries
+        env:
+          GOOS: linux
+          PKG: k8s.io/ingress-nginx
+          TAG: ${{ inputs.version }}
+          COMMIT_SHA: ${{ github.sha }}
+          REPO_INFO: ${{ github.server_url }}/${{ github.repository }}
+        run: bash build/build.sh
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      # Compile first so the registry credentials do not expire during the build.
+      - name: Build proxy
+        run: docker buildx build --platform "linux/${ARCH}" images/nginx/rootfs
+
+      - uses: scheiblingco/redskap-actions/docker-login@v2
+        with:
+          instance: https://pkg.osshield.eu
+          vhost: cr.osshield.eu
+
+      - name: Push platform proxy image
+        id: proxy
+        run: |
+          docker buildx build \
+            --platform "linux/${ARCH}" \
+            --tag "${PROXY_IMAGE}:${BUILD_TAG}" \
+            --metadata-file proxy-metadata.json \
+            --push \
+            images/nginx/rootfs
+
+          digest=$(jq -er '."containerimage.digest"' proxy-metadata.json)
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push platform controller image
+        id: controller
+        env:
+          PROXY_DIGEST: ${{ steps.proxy.outputs.digest }}
+        run: |
+          docker buildx build \
+            --platform "linux/${ARCH}" \
+            --build-arg "BASE_IMAGE=${PROXY_IMAGE}@${PROXY_DIGEST}" \
+            --build-arg "VERSION=${IMAGE_VERSION_TAG}" \
+            --build-arg "COMMIT_SHA=${GITHUB_SHA}" \
+            --build-arg "BUILD_ID=${GITHUB_RUN_ID}" \
+            --tag "${CONTROLLER_IMAGE}:${BUILD_TAG}" \
+            --metadata-file controller-metadata.json \
+            --push \
+            rootfs
+
+          digest=$(jq -er '."containerimage.digest"' controller-metadata.json)
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"

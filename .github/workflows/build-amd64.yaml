@@ -1,0 +1,29 @@
+name: Build amd64 images
+
+on:
+  workflow_call:
+    inputs:
+      controller_image:
+        type: string
+        required: true
+      proxy_image:
+        type: string
+        required: true
+      version:
+        type: string
+        required: true
+    outputs:
+      proxy_digest:
+        value: ${{ jobs.build.outputs.proxy_digest }}
+      controller_digest:
+        value: ${{ jobs.build.outputs.controller_digest }}
+
+jobs:
+  build:
+    uses: ./.github/workflows/build-image-platform.yaml
+    with:
+      arch: amd64
+      runner: ubuntu-24.04
+      controller_image: ${{ inputs.controller_image }}
+      proxy_image: ${{ inputs.proxy_image }}
+      version: ${{ inputs.version }}
