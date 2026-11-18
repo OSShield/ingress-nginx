@@ -1,8 +1,8 @@
 name: Chart
 
 on:
-  schedule:
-    - cron: '0 0 * * 1' # every Monday at 00:00 UTC
+  # schedule:
+  #   - cron: '0 0 * * 1' # every Monday at 00:00 UTC
   workflow_dispatch:
 
 permissions:
